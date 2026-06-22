@@ -230,4 +230,3 @@ MIT — do whatever you want with it.
 ---
 
 *Built with WebLLM, Transformers.js, React, and a healthy distrust of cloud services.*
-# -Pocket-Brain

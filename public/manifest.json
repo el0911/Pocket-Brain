@@ -8,9 +8,9 @@
     "sidePanel"
   ],
   "host_permissions": ["<all_urls>"],
- "content_security_policy": {
-  "extension_pages": "script-src 'self' 'wasm-unsafe-eval' blob:; worker-src 'self' blob:; object-src 'self'"
-},
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
   "background": {
     "service_worker": "background/service-worker.js",
     "type": "module"

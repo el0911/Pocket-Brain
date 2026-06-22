@@ -1,9 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { LLM_MODELS, DEFAULT_LLM_MODEL, TOP_K } from "../utils/config.js";
-import { embedText, saveData, loadAllChunks, getChunkCount } from "./embedder.js";
+import { embedText, saveData, loadAllChunks, getChunkCount, loadModel, streamAnswer } from "./embedder.js";
 import { retrieveTopK, buildPrompt } from "../utils/rag.js";
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
 const css = `
   :root {
     --bg: #0f0f1a; --surface: #16162a; --surface2: #1e1e35;
@@ -50,7 +49,6 @@ const css = `
   .messages { flex: 1; overflow-y: auto; padding: 16px 12px; display: flex; flex-direction: column; gap: 12px; scroll-behavior: smooth; }
   .messages::-webkit-scrollbar { width: 4px; }
   .messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-
   .empty-state { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--text-dim); gap: 10px; text-align: center; padding: 32px; }
   .empty-icon { width: 48px; height: 48px; border-radius: 50%; background: var(--accent-dim); display: flex; align-items: center; justify-content: center; color: var(--accent); }
   .empty-title { font-size: 15px; font-weight: 600; color: var(--text); }
@@ -145,7 +143,6 @@ function Message({ msg }) {
   );
 }
 
-// ─── Data Tab ─────────────────────────────────────────────────────────────────
 function DataTab() {
   const [text, setText] = useState("");
   const [saving, setSaving] = useState(false);
@@ -199,7 +196,6 @@ function DataTab() {
   );
 }
 
-// ─── Chat Tab ─────────────────────────────────────────────────────────────────
 function ChatTab() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
@@ -209,9 +205,7 @@ function ChatTab() {
   const [loadProgress, setLoadProgress] = useState(0);
   const [isStreaming, setIsStreaming] = useState(false);
   const [chunkCount, setChunkCount] = useState(null);
-
   const messagesEndRef = useRef(null);
-  const portRef = useRef(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -224,31 +218,22 @@ function ChatTab() {
     }).catch(() => {});
   }, []);
 
-  const getPort = useCallback(() => {
-    if (portRef.current) return portRef.current;
-    const port = chrome.runtime.connect({ name: "rag-stream" });
-    portRef.current = port;
-    port.onDisconnect.addListener(() => { portRef.current = null; });
-    return port;
-  }, []);
-
-  const handleLoadModel = useCallback(() => {
-    const port = getPort();
+  const handleLoadModel = useCallback(async () => {
     setStatus({ state: "loading", text: "Loading model…" });
     setLoadProgress(0);
-    port.postMessage({ type: "LOAD_MODEL", modelId: selectedModel });
-    const listener = (msg) => {
-      if (msg.type === "llm-progress") { setStatus({ state: "loading", text: msg.text }); setLoadProgress(Math.round((msg.progress ?? 0) * 100)); }
-      if (msg.type === "llm-ready") {
-        setLoadedModel(msg.modelId); setLoadProgress(100);
-        const label = LLM_MODELS.find(m => m.id === msg.modelId)?.label ?? msg.modelId;
-        setStatus({ state: "ready", text: `${label} · ${chunkCount ?? "?"} chunks` });
-        port.onMessage.removeListener(listener);
-      }
-      if (msg.type === "error") { setStatus({ state: "error", text: msg.error }); port.onMessage.removeListener(listener); }
-    };
-    port.onMessage.addListener(listener);
-  }, [selectedModel, chunkCount, getPort]);
+    try {
+      await loadModel(selectedModel, (p) => {
+        setStatus({ state: "loading", text: p.text });
+        setLoadProgress(Math.round((p.progress ?? 0) * 100));
+      });
+      setLoadedModel(selectedModel);
+      setLoadProgress(100);
+      const label = LLM_MODELS.find(m => m.id === selectedModel)?.label ?? selectedModel;
+      setStatus({ state: "ready", text: `${label} · ${chunkCount ?? "?"} chunks` });
+    } catch (e) {
+      setStatus({ state: "error", text: `Error: ${e.message}` });
+    }
+  }, [selectedModel, chunkCount]);
 
   const handleSend = useCallback(async () => {
     const query = input.trim();
@@ -261,7 +246,6 @@ function ChatTab() {
     setMessages(prev => [...prev, { id: assistantId, role: "assistant", content: "", streaming: true, sources: null }]);
 
     try {
-      // Embed query + retrieve chunks in the sidebar
       const queryEmbedding = new Float32Array(await embedText(query));
       const allChunks = await loadAllChunks();
       const topChunks = retrieveTopK(queryEmbedding, allChunks, TOP_K);
@@ -271,31 +255,17 @@ function ChatTab() {
         ...m, sources: topChunks.map(c => ({ id: c.id, score: c.score, text: c.text.slice(0, 120) }))
       } : m));
 
-      // Send prompt to service worker for LLM streaming
-      const port = getPort();
-      port.postMessage({ type: "STREAM_QUERY", prompt, modelId: loadedModel });
-
-      const listener = (msg) => {
-        if (msg.type === "token") {
-          setMessages(prev => prev.map(m => m.id === assistantId ? { ...m, content: m.content + msg.token } : m));
-        }
-        if (msg.type === "done") {
-          setMessages(prev => prev.map(m => m.id === assistantId ? { ...m, streaming: false } : m));
-          setIsStreaming(false);
-          port.onMessage.removeListener(listener);
-        }
-        if (msg.type === "error") {
-          setMessages(prev => prev.map(m => m.id === assistantId ? { ...m, role: "error", content: `Error: ${msg.error}`, streaming: false } : m));
-          setIsStreaming(false);
-          port.onMessage.removeListener(listener);
-        }
-      };
-      port.onMessage.addListener(listener);
+      await streamAnswer(
+        prompt,
+        (token) => setMessages(prev => prev.map(m => m.id === assistantId ? { ...m, content: m.content + token } : m)),
+        () => { setMessages(prev => prev.map(m => m.id === assistantId ? { ...m, streaming: false } : m)); setIsStreaming(false); },
+        (err) => { setMessages(prev => prev.map(m => m.id === assistantId ? { ...m, role: "error", content: `Error: ${err}`, streaming: false } : m)); setIsStreaming(false); }
+      );
     } catch (e) {
       setMessages(prev => prev.map(m => m.id === assistantId ? { ...m, role: "error", content: `Error: ${e.message}`, streaming: false } : m));
       setIsStreaming(false);
     }
-  }, [input, isStreaming, loadedModel, getPort]);
+  }, [input, isStreaming, loadedModel]);
 
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); }
@@ -357,7 +327,6 @@ function ChatTab() {
   );
 }
 
-// ─── App ──────────────────────────────────────────────────────────────────────
 export default function App() {
   const [tab, setTab] = useState("chat");
   return (
@@ -365,7 +334,7 @@ export default function App() {
       <div className="header">
         <div className="header-icon"><ChatIcon /></div>
         <div>
-          <div className="header-title">RAG Assistant</div>
+          <div className="header-title">Pocket Brain</div>
           <div className="header-subtitle">On-device · Private</div>
         </div>
       </div>
